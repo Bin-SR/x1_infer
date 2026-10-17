@@ -39,6 +39,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <fcntl.h>
+#include <termios.h>
 
 namespace xyber_x1_infer::joy_stick_module {
 
@@ -82,7 +84,7 @@ Joy::Joy() {
   // source.
   publish_soon_time_ = high_resolution_clock::now();
 
-  if (SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC) < 0) {
+  if (SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC | SDL_INIT_VIDEO) < 0) {
     throw std::runtime_error("SDL could not be initialized: " + std::string(SDL_GetError()));
   }
   // In theory we could do this with just a timer, which would simplify the code
@@ -362,10 +364,84 @@ void Joy::handleJoyDeviceRemoved(const SDL_Event& e) {
 void Joy::eventThread() {
   auto last_publish = high_resolution_clock::now();
 
+  // Keyboard shortcuts reuse the configured joystick button mappings:
+  // 1: idle, 2: zero, 3: stand, 4: walk_leg, 5: walk_leg_arm,
+  // 6: keep, 7: plan, 8: x1_Leo policy. The key is treated as held while pressed.
+  const auto keyboard_button = [](SDL_Keycode key) -> int {
+    switch (key) {
+      case SDLK_1: return 7;  // idle
+      case SDLK_2: return 1;  // zero
+      case SDLK_3: return 0;  // stand
+      case SDLK_4: return 2;  // walk_leg
+      case SDLK_5: return 3;  // walk_leg_arm
+      case SDLK_6: return 6;  // keep
+      case SDLK_7: return 5;  // plan
+      case SDLK_8: return 8;  // x1_Leo policy
+      default: return -1;
+    }
+  };
+
+  // Keyboard velocity control reuses the joystick mapping in joy_x1.yaml:
+  // axis 0 = lateral, axis 1 = forward/backward, axis 3 = yaw, button 4
+  // enables /cmd_vel. Values remain active until x is pressed.
+  const auto set_keyboard_motion = [](char key, JoyStruct& data) -> bool {
+    if (data.axis.size() < 4) data.axis.resize(4, 0.0);
+    if (data.buttons.size() < 9) data.buttons.resize(9, 0);
+    switch (key) {
+      case 'w': data.axis[1] = 0.5; data.buttons[4] = 1; return true;
+      case 's': data.axis[1] = -0.5; data.buttons[4] = 1; return true;
+      case 'a': data.axis[0] = 0.3; data.buttons[4] = 1; return true;
+      case 'd': data.axis[0] = -0.3; data.buttons[4] = 1; return true;
+      case 'q': data.axis[3] = 0.4; data.buttons[4] = 1; return true;
+      case 'e': data.axis[3] = -0.4; data.buttons[4] = 1; return true;
+      case 'x':
+        data.axis[0] = data.axis[1] = data.axis[3] = 0.0;
+        // Keep the velocity publisher enabled so the limiter receives an
+        // explicit zero command instead of retaining the previous velocity.
+        data.buttons[4] = 1;
+        return true;
+      default: return false;
+    }
+  };
+
+  const bool stdin_is_tty = isatty(STDIN_FILENO);
+  struct termios old_terminal{};
+  bool terminal_configured = false;
+  if (stdin_is_tty && tcgetattr(STDIN_FILENO, &old_terminal) == 0) {
+    auto terminal = old_terminal;
+    terminal.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
+    terminal.c_cc[VMIN] = 0;
+    terminal.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &terminal);
+    const int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    terminal_configured = true;
+  }
+
   while (is_runnig_) {
     bool should_publish = false;
+
+    // The MuJoCo window receives GLFW keyboard events, not SDL events. Read
+    // numeric mode keys from the terminal running run_sim.sh as well.
+    if (stdin_is_tty) {
+      char key = 0;
+      if (read(STDIN_FILENO, &key, 1) == 1) {
+        std::lock_guard<std::mutex> lk(joy_msg_mutex_);
+        if (set_keyboard_motion(key, joy_msg_)) {
+          should_publish = true;
+        } else if (key >= '1' && key <= '8') {
+          const int button = keyboard_button(static_cast<SDL_Keycode>(key));
+          if (joy_msg_.buttons.size() < 9) joy_msg_.buttons.resize(9, 0);
+          // Change mode without clearing the keyboard velocity enable state.
+          for (size_t i = 0; i < 4; ++i) joy_msg_.buttons[i] = 0;
+          joy_msg_.buttons[button] = 1;
+          should_publish = true;
+        }
+      }
+    }
+
     SDL_Event e;
-    int wait_time_ms = autorepeat_interval_ms_;
+    int wait_time_ms = std::min(autorepeat_interval_ms_, 20);
     if (publish_soon_) {
       wait_time_ms = std::min(wait_time_ms, coalesce_interval_ms_);
     }
@@ -385,9 +461,33 @@ void Joy::eventThread() {
         handleJoyDeviceAdded(e);
       } else if (e.type == SDL_JOYDEVICEREMOVED) {
         handleJoyDeviceRemoved(e);
+      } else if (e.type == SDL_KEYDOWN) {
+        const auto key = e.key.keysym.sym;
+        const char ascii = key >= SDLK_a && key <= SDLK_z
+            ? static_cast<char>('a' + (key - SDLK_a)) : 0;
+        if (ascii != 0 && set_keyboard_motion(ascii, joy_msg_)) {
+          should_publish = true;
+        } else {
+          const int button = keyboard_button(key);
+          if (button >= 0) {
+            if (joy_msg_.buttons.size() < 9) joy_msg_.buttons.resize(9, 0);
+            for (size_t i = 0; i < 4; ++i) joy_msg_.buttons[i] = 0;
+            joy_msg_.buttons[button] = 1;
+            should_publish = true;
+          }
+        }
+      } else if (e.type == SDL_KEYUP) {
+        // Terminal control is persistent; SDL key-up only stops motion keys.
+        const auto key = e.key.keysym.sym;
+        const char ascii = key >= SDLK_a && key <= SDLK_z
+            ? static_cast<char>('a' + (key - SDLK_a)) : 0;
+        if (ascii == 'w' || ascii == 's' || ascii == 'a' || ascii == 'd' ||
+            ascii == 'q' || ascii == 'e') {
+          should_publish = true;
+        }
       } else {
-        std::cout << "Unknown event type " << e.type << std::endl;
-        ;
+        // Ignore unrelated SDL events. MuJoCo and the desktop window generate
+        // many events that are not joystick input.
       }
     } else {
       // We didn't succeed, either because of a failure or because of a timeout.
@@ -403,9 +503,13 @@ void Joy::eventThread() {
       }
     }
 
-    if (joystick_ != nullptr && should_publish) {
+    if (should_publish) {
       is_update_.store(true);
     }
+  }
+
+  if (terminal_configured) {
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_terminal);
   }
 }
 }  // namespace xyber_x1_infer::joy_stick_module

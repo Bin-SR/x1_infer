@@ -26,6 +26,13 @@ void PDController::Init(const YAML::Node &cfg_node) {
   joint_conf_.init_state = Eigen::Map<vector_t>(cfg_node["init_state"].as<std::vector<double>>().data(), cfg_node["init_state"].as<std::vector<double>>().size());
   joint_conf_.stiffness = Eigen::Map<vector_t>(cfg_node["stiffness"].as<std::vector<double>>().data(), cfg_node["stiffness"].as<std::vector<double>>().size());
   joint_conf_.damping = Eigen::Map<vector_t>(cfg_node["damping"].as<std::vector<double>>().data(), cfg_node["damping"].as<std::vector<double>>().size());
+
+  // The initial FSM state is activated without a transition event.  Therefore
+  // start_joint_angles_ must be initialized here as well; otherwise the first
+  // control cycle dereferences an empty vector in GetJointCmdData().
+  start_joint_angles_.assign(joint_conf_.init_state.data(),
+                             joint_conf_.init_state.data() + joint_conf_.init_state.size());
+
   // std::cout << "init_state: " << joint_conf_.init_state.transpose() << std::endl;
   // std::cout << "stiffness: " << joint_conf_.stiffness.transpose() << std::endl;
   // std::cout << "damping: " << joint_conf_.damping.transpose() << std::endl;

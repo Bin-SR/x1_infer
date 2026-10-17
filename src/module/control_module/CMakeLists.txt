@@ -62,7 +62,8 @@ target_link_libraries(
          geometry_msgs::geometry_msgs__rosidl_typesupport_fastrtps_cpp
          geometry_msgs::geometry_msgs__rosidl_typesupport_introspection_cpp
          onnxruntime
-         ruckig)
+         ruckig
+         minizip)
 
 # Set test of target
 if(XYBER_X1_INFER_BUILD_TESTS AND test_files)

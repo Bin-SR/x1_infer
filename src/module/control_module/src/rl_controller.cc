@@ -1,6 +1,9 @@
 #include "control_module/rl_controller.h"
 #include <string.h>
 #include <iostream>
+#include <fstream>
+#include <cstring>
+#include <minizip/unzip.h>
 
 namespace xyber_x1_infer::rl_control_module {
 
@@ -13,6 +16,17 @@ void RLController::Init(const YAML::Node& cfg_node) {
   // 初始化 joint_names_
   joint_names_.clear();
   joint_names_ = cfg_node["joint_list"].as<std::vector<std::string>>();
+  publish_joint_names_ = cfg_node["publish_joint_list"]
+      ? cfg_node["publish_joint_list"].as<std::vector<std::string>>()
+      : joint_names_;
+  publish_action_indices_.clear();
+  for (const auto& name : publish_joint_names_) {
+    auto iter = std::find(joint_names_.begin(), joint_names_.end(), name);
+    if (iter == joint_names_.end()) {
+      throw std::runtime_error("Unknown publish joint: " + name);
+    }
+    publish_action_indices_.push_back(static_cast<int>(std::distance(joint_names_.begin(), iter)));
+  }
   // printf("joint_names_: ");
   // for (const auto &name : joint_names_) {
   //   printf("%s ", name.c_str());
@@ -34,6 +48,9 @@ void RLController::Init(const YAML::Node& cfg_node) {
   // 其他 RL 参数
   // clang-format off
   walk_step_conf_.action_scale  = cfg_node["walk_step_conf"]["action_scale"].as<double>();
+  walk_step_conf_.action_scales = cfg_node["walk_step_conf"]["action_scales"]
+      ? cfg_node["walk_step_conf"]["action_scales"].as<std::vector<double>>()
+      : std::vector<double>();
   walk_step_conf_.decimation    = cfg_node["walk_step_conf"]["decimation"].as<int32_t>();
   walk_step_conf_.cycle_time    = cfg_node["walk_step_conf"]["cycle_time"].as<double>();
   walk_step_conf_.sw_mode       = cfg_node["walk_step_conf"]["sw_mode"].as<bool>();
@@ -49,10 +66,45 @@ void RLController::Init(const YAML::Node& cfg_node) {
   onnx_conf_.num_hist           = cfg_node["onnx_conf"]["num_hist"].as<int32_t>();
   onnx_conf_.observations_clip  = cfg_node["onnx_conf"]["observations_clip"].as<double>();
   onnx_conf_.actions_clip       = cfg_node["onnx_conf"]["actions_clip"].as<double>();
+  if (!walk_step_conf_.action_scales.empty() &&
+      walk_step_conf_.action_scales.size() != static_cast<size_t>(onnx_conf_.actions_size)) {
+    throw std::runtime_error("action_scales size must equal actions_size");
+  }
+  reference_joint_pos_ = cfg_node["reference_joint_pos"]
+      ? cfg_node["reference_joint_pos"].as<std::vector<float>>()
+      : std::vector<float>(onnx_conf_.actions_size, 0.0F);
+  reference_joint_vel_ = cfg_node["reference_joint_vel"]
+      ? cfg_node["reference_joint_vel"].as<std::vector<float>>()
+      : std::vector<float>(onnx_conf_.actions_size, 0.0F);
+  reference_anchor_ori_ = cfg_node["reference_anchor_ori"]
+      ? cfg_node["reference_anchor_ori"].as<std::vector<float>>()
+      : std::vector<float>{1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F};
+
+  // Only the x1_Leo tracking policy uses the 29-DoF/154-observation
+  // reference format. Keep the existing 12/14-DoF walking policies valid.
+  if (onnx_conf_.actions_size == 29) {
+    if (reference_joint_pos_.size() != 29 || reference_joint_vel_.size() != 29 ||
+        reference_anchor_ori_.size() != 6) {
+      throw std::runtime_error(
+          "x1_Leo reference dimensions must be 29, 29, and 6; got " +
+          std::to_string(reference_joint_pos_.size()) + ", " +
+          std::to_string(reference_joint_vel_.size()) + ", " +
+          std::to_string(reference_anchor_ori_.size()));
+    }
+  } else {
+    if (reference_joint_pos_.size() != static_cast<size_t>(onnx_conf_.actions_size) ||
+        reference_joint_vel_.size() != static_cast<size_t>(onnx_conf_.actions_size)) {
+      reference_joint_pos_.assign(onnx_conf_.actions_size, 0.0F);
+      reference_joint_vel_.assign(onnx_conf_.actions_size, 0.0F);
+    }
+  }
   lpf_conf_.wc                  = cfg_node["lpf_conf"]["wc"].as<double>();
   lpf_conf_.ts                  = cfg_node["lpf_conf"]["ts"].as<double>();
   auto paralle_list = cfg_node["lpf_conf"]["paralle_list"].as<std::vector<std::string>>();
   lpf_conf_.paralle_list        = std::set<std::string>(paralle_list.begin(), paralle_list.end());
+  if (cfg_node["motion_file"]) {
+    LoadMotionReference(cfg_node["motion_file"].as<std::string>());
+  }
   LoadModel();
   // clang-format on
   actions_.resize(onnx_conf_.actions_size);
@@ -71,10 +123,14 @@ void RLController::Init(const YAML::Node& cfg_node) {
 
 void RLController::RestartController() {
   is_first_frame_ = true;
+  loop_count_ = 0;
 }
 
 void RLController::Update() {
   UpdateStateEstimation();
+  if (onnx_conf_.actions_size == 29 && use_motion_reference_) {
+    UpdateMotionReference();
+  }
   // compute observation & actions
   if (loop_count_ % walk_step_conf_.decimation == 0) {
     ComputeObservation();
@@ -85,40 +141,129 @@ void RLController::Update() {
 
 my_ros2_proto::msg::JointCommand RLController::GetJointCmdData() {
   my_ros2_proto::msg::JointCommand joint_cmd;
-  joint_cmd.name = joint_names_;
-  joint_cmd.position.resize(joint_names_.size());
-  joint_cmd.velocity.resize(joint_names_.size());
-  joint_cmd.effort.resize(joint_names_.size());
-  joint_cmd.damping.resize(joint_names_.size());
-  joint_cmd.stiffness.resize(joint_names_.size());
+  joint_cmd.name = publish_joint_names_;
+  joint_cmd.position.resize(publish_joint_names_.size());
+  joint_cmd.velocity.resize(publish_joint_names_.size());
+  joint_cmd.effort.resize(publish_joint_names_.size());
+  joint_cmd.damping.resize(publish_joint_names_.size());
+  joint_cmd.stiffness.resize(publish_joint_names_.size());
 
-  // get action
-  for (int ii = 0; ii < onnx_conf_.actions_size; ii++) {
-    scalar_t pos_des = actions_[ii] * walk_step_conf_.action_scale + joint_conf_.init_state(ii);
+  // Keep all 29 actions for the next observation, including the three waist
+  // actions that are not published because PD owns those joints.
+  for (int ii = 0; ii < onnx_conf_.actions_size; ++ii) {
+    last_actions_(ii, 0) = actions_[ii];
+  }
+
+  // Body joints are intentionally excluded from the published command and
+  // remain controlled by pd_zero/pd_stand.
+  for (size_t jj = 0; jj < publish_action_indices_.size(); ++jj) {
+    const int ii = publish_action_indices_[jj];
+    const double action_scale = walk_step_conf_.action_scales.empty()
+        ? walk_step_conf_.action_scale : walk_step_conf_.action_scales[ii];
+    scalar_t pos_des = actions_[ii] * action_scale + joint_conf_.init_state(ii);
     double stiffness = joint_conf_.stiffness(ii);
     double damping = joint_conf_.damping(ii);
 
     if (lpf_conf_.paralle_list.find(joint_names_[ii]) == lpf_conf_.paralle_list.end()) {
       low_pass_filters_[ii].input(pos_des);
       double pos_des_lp = low_pass_filters_[ii].output();
-      joint_cmd.position[ii] = pos_des_lp;
-      joint_cmd.velocity[ii] = 0.0;
-      joint_cmd.effort[ii] = 0.0;
-      joint_cmd.stiffness[ii] = stiffness;
-      joint_cmd.damping[ii] = damping;
+      joint_cmd.position[jj] = pos_des_lp;
+      joint_cmd.velocity[jj] = 0.0;
+      joint_cmd.effort[jj] = 0.0;
+      joint_cmd.stiffness[jj] = stiffness;
+      joint_cmd.damping[jj] = damping;
     } else {
       double tau_des = stiffness * (pos_des - propri_.joint_pos[ii]) + damping * (0.0 - propri_.joint_vel[ii]);
       low_pass_filters_[ii].input(tau_des);
       double tau_des_lp = low_pass_filters_[ii].output();
-      joint_cmd.position[ii] = 0.0;
-      joint_cmd.velocity[ii] = 0.0;
-      joint_cmd.effort[ii] = tau_des_lp;
-      joint_cmd.stiffness[ii] = 0.0;
-      joint_cmd.damping[ii] = 0.0;
+      joint_cmd.position[jj] = 0.0;
+      joint_cmd.velocity[jj] = 0.0;
+      joint_cmd.effort[jj] = tau_des_lp;
+      joint_cmd.stiffness[jj] = 0.0;
+      joint_cmd.damping[jj] = 0.0;
     }
-    last_actions_(ii, 0) = actions_[ii];
   }
   return joint_cmd;
+}
+
+namespace {
+
+std::vector<uint8_t> ReadNpyFromNpz(const std::string& path, const std::string& name) {
+  unzFile zip = unzOpen(path.c_str());
+  if (!zip) throw std::runtime_error("Cannot open motion npz: " + path);
+  if (unzLocateFile(zip, name.c_str(), 0) != UNZ_OK) {
+    unzClose(zip);
+    throw std::runtime_error("Missing array in motion npz: " + name);
+  }
+  unz_file_info info{};
+  char filename[256]{};
+  unzGetCurrentFileInfo(zip, &info, filename, sizeof(filename), nullptr, 0, nullptr, 0);
+  if (unzOpenCurrentFile(zip) != UNZ_OK) { unzClose(zip); throw std::runtime_error("Cannot read npy: " + name); }
+  std::vector<uint8_t> bytes(info.uncompressed_size);
+  int got = unzReadCurrentFile(zip, bytes.data(), static_cast<unsigned>(bytes.size()));
+  unzCloseCurrentFile(zip);
+  unzClose(zip);
+  if (got != static_cast<int>(bytes.size())) throw std::runtime_error("Incomplete npy: " + name);
+  const bool valid_magic = bytes.size() >= 10 &&
+      bytes[0] == 0x93 && bytes[1] == 'N' && bytes[2] == 'U' &&
+      bytes[3] == 'M' && bytes[4] == 'P' && bytes[5] == 'Y';
+  if (!valid_magic) {
+    throw std::runtime_error("Invalid npy header: " + name);
+  }
+  const uint8_t major = bytes[6];
+  size_t header_len = major == 1 ? bytes[8] | (bytes[9] << 8)
+                                 : *reinterpret_cast<const uint32_t*>(bytes.data() + 8);
+  size_t header_size = major == 1 ? 10 : 12;
+  if (header_size + header_len > bytes.size()) throw std::runtime_error("Invalid npy size: " + name);
+  std::string header(reinterpret_cast<const char*>(bytes.data() + header_size), header_len);
+  if (header.find("'descr': '<f4'") == std::string::npos &&
+      header.find("'descr': '<f8'") == std::string::npos)
+    throw std::runtime_error("Only little-endian float npy is supported: " + name);
+  return std::vector<uint8_t>(bytes.begin() + header_size + header_len, bytes.end());
+}
+
+template <typename T>
+std::vector<float> NpyFloat32(const std::vector<uint8_t>& bytes) {
+  std::vector<float> out(bytes.size() / sizeof(T));
+  for (size_t i = 0; i < out.size(); ++i) out[i] = static_cast<float>(reinterpret_cast<const T*>(bytes.data())[i]);
+  return out;
+}
+
+}  // namespace
+
+void RLController::LoadMotionReference(const std::string& path) {
+  if (onnx_conf_.actions_size != 29) return;
+  auto pos_bytes = ReadNpyFromNpz(path, "joint_pos.npy");
+  auto vel_bytes = ReadNpyFromNpz(path, "joint_vel.npy");
+  auto quat_bytes = ReadNpyFromNpz(path, "body_quat_w.npy");
+  auto pos = NpyFloat32<float>(pos_bytes);
+  auto vel = NpyFloat32<float>(vel_bytes);
+  auto quat = NpyFloat32<float>(quat_bytes);
+  if (pos.size() % 29 != 0 || vel.size() != pos.size() || quat.size() != (pos.size() / 29) * 30 * 4)
+    throw std::runtime_error("Invalid X1 motion array dimensions in " + path);
+  motion_frames_ = static_cast<int>(pos.size() / 29);
+  motion_joint_pos_ = std::move(pos);
+  motion_joint_vel_ = std::move(vel);
+  motion_anchor_quat_ = std::move(quat);
+  motion_fps_ = 50.0;
+  use_motion_reference_.store(true);
+  std::cout << "Loaded motion reference [" << path << "], frames="
+            << motion_frames_ << ", fps=" << motion_fps_ << std::endl;
+}
+
+void RLController::UpdateMotionReference() {
+  if (motion_frames_ <= 0 || motion_fps_ <= 0.0) return;
+  // ControlModule runs at 1000 Hz in the X1 configuration.
+  const int frame = std::min(motion_frames_ - 1,
+      static_cast<int>(loop_count_ * motion_fps_ / 1000.0));
+  reference_joint_pos_.assign(motion_joint_pos_.begin() + frame * 29,
+                              motion_joint_pos_.begin() + (frame + 1) * 29);
+  reference_joint_vel_.assign(motion_joint_vel_.begin() + frame * 29,
+                              motion_joint_vel_.begin() + (frame + 1) * 29);
+  const float* q = motion_anchor_quat_.data() + (frame * 30) * 4;
+  Eigen::Quaternionf quat(q[0], q[1], q[2], q[3]);
+  Eigen::Matrix3f r = quat.normalized().toRotationMatrix();
+  reference_anchor_ori_ = {r(0,0), r(0,1), r(1,0), r(1,1), r(2,0), r(2,1)};
 }
 
 void RLController::LoadModel() {
@@ -179,31 +324,47 @@ void RLController::UpdateStateEstimation() {
 }
 
 void RLController::ComputeObservation() {
-  // actions
   vector_t propri_obs(onnx_conf_.observations_size);
-  {
+  propri_obs.setZero();
+  if (onnx_conf_.actions_size == 29 && onnx_conf_.observations_size == 154) {
+    // unitree_rl_mjlab X1 tracking actor (has_state_estimation=False):
+    // ref q(29), ref dq(29), ref anchor ori(6), base gyro(3), q(29), dq(29),
+    // previous action(29).
+    for (int i = 0; i < 29; ++i) {
+      propri_obs(i) = reference_joint_pos_[i];
+      propri_obs(29 + i) = reference_joint_vel_[i];
+      propri_obs(2 * 29 + 6 + 3 + i) =
+          (propri_.joint_pos(i) - joint_conf_.init_state(i)) * obs_scales_.dof_pos;
+      propri_obs(2 * 29 + 6 + 3 + 29 + i) =
+          propri_.joint_vel(i) * obs_scales_.dof_vel;
+      propri_obs(2 * 29 + 6 + 3 + 2 * 29 + i) = last_actions_(i);
+    }
+    for (int i = 0; i < 6; ++i) {
+      propri_obs(58 + i) = reference_anchor_ori_[i];
+    }
+    for (int i = 0; i < 3; ++i) {
+      propri_obs(64 + i) = propri_.base_ang_vel(i) * obs_scales_.ang_vel;
+    }
+  } else {
+    // Original walking policies: phase, command, relative q/dq and action.
     std::shared_lock<std::shared_mutex> lock(joy_mutex_);
     double phase = duration<double>(high_resolution_clock::now().time_since_epoch()).count();
     if (walk_step_conf_.sw_mode) {
       double cmd_norm = std::sqrt(Square(joy_data_.linear.x) + Square(joy_data_.linear.y) + Square(joy_data_.angular.z));
-      if (cmd_norm <= walk_step_conf_.cmd_threshold) {
-        phase = 0;
-      }
+      if (cmd_norm <= walk_step_conf_.cmd_threshold) phase = 0;
     }
-    phase = phase / walk_step_conf_.cycle_time;
-
-    // clang-format off
-    propri_obs << sin(2 * M_PI * phase),  // 1
-                  cos(2 * M_PI * phase),  // 1
-                  joy_data_.linear.x * obs_scales_.lin_vel, // 1
-                  joy_data_.linear.y * obs_scales_.lin_vel, // 1
-                  joy_data_.angular.z, // 1
-                  (propri_.joint_pos - joint_conf_.init_state) * obs_scales_.dof_pos, // action_size
-                  propri_.joint_vel * obs_scales_.dof_vel, // action_size
-                  last_actions_, // action_size
-                  propri_.base_ang_vel * obs_scales_.ang_vel, // 3
-                  propri_.base_euler_xyz * obs_scales_.quat; // 3
-    // clang-format on
+    phase /= walk_step_conf_.cycle_time;
+    vector_t native_obs(5 + onnx_conf_.actions_size * 3 + 6);
+    native_obs << sin(2 * M_PI * phase), cos(2 * M_PI * phase),
+                  joy_data_.linear.x * obs_scales_.lin_vel,
+                  joy_data_.linear.y * obs_scales_.lin_vel,
+                  joy_data_.angular.z,
+                  (propri_.joint_pos - joint_conf_.init_state) * obs_scales_.dof_pos,
+                  propri_.joint_vel * obs_scales_.dof_vel, last_actions_,
+                  propri_.base_ang_vel * obs_scales_.ang_vel,
+                  propri_.base_euler_xyz * obs_scales_.quat;
+    const int count = std::min<int>(native_obs.size(), propri_obs.size());
+    propri_obs.head(count) = native_obs.head(count);
   }
 
   if (is_first_frame_) {

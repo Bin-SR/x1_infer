@@ -25,10 +25,13 @@ class RLController : public ControllerBase {
   void UpdateStateEstimation();
   void ComputeObservation();
   void ComputeActions();
+  void LoadMotionReference(const std::string& path);
+  void UpdateMotionReference();
 
  private:
   struct WalkStepConf {
     double action_scale;
+    std::vector<double> action_scales;
     int decimation;
     double cycle_time;
     bool sw_mode;
@@ -65,6 +68,20 @@ class RLController : public ControllerBase {
   std::vector<const char *> output_names_;
   std::vector<std::vector<int64_t>> input_shapes_;
   std::vector<std::vector<int64_t>> output_shapes_;
+
+  // Policy joint order follows the 29-DoF X1 training order. The optional
+  // publish list excludes waist joints that remain under PD control.
+  std::vector<std::string> publish_joint_names_;
+  std::vector<int> publish_action_indices_;
+  std::vector<float> reference_joint_pos_;
+  std::vector<float> reference_joint_vel_;
+  std::vector<float> reference_anchor_ori_;
+  std::vector<float> motion_joint_pos_;
+  std::vector<float> motion_joint_vel_;
+  std::vector<float> motion_anchor_quat_;
+  int motion_frames_{0};
+  double motion_fps_{0.0};
+  std::atomic_bool use_motion_reference_{false};
 
   // compute in algorithm
   std::vector<float> actions_;

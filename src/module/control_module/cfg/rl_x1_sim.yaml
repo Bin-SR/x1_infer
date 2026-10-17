@@ -41,6 +41,12 @@ robot_states:
     pre_states: [stand_&_plan, walk_leg_&_plan, stand, walk_leg]
     controllers: [pd_zero, pd_stand, rl_walk_leg_shoulder]
 
+  # x1_Leo ONNX 行走模式
+  leo:
+    trigger_topic: /leo_mode
+    pre_states: [stand, walk_leg, leo]
+    controllers: [pd_zero, pd_stand, rl_leo]
+
   # plan模式
   stand_&_plan:
     trigger_topic: /plan_mode
@@ -261,6 +267,91 @@ controllers:
       num_hist: 66
       observations_clip: 100.
       actions_clip: 100.
+    lpf_conf:
+      wc: 100.
+      ts: 0.001
+      paralle_list:
+        - left_ankle_pitch_joint
+        - left_ankle_roll_joint
+        - right_ankle_pitch_joint
+        - right_ankle_roll_joint
+
+
+  # x1_Leo policy
+  rl_leo:
+    # Must match unitree_rl_mjlab X1 joint/action order: waist(3), arms(14), legs(12).
+    joint_list: [lumbar_yaw_joint, lumbar_roll_joint, lumbar_pitch_joint,
+                left_shoulder_pitch_joint, left_shoulder_roll_joint, left_shoulder_yaw_joint,
+                left_elbow_pitch_joint, left_elbow_yaw_joint, left_wrist_pitch_joint, left_wrist_roll_joint,
+                right_shoulder_pitch_joint, right_shoulder_roll_joint, right_shoulder_yaw_joint,
+                right_elbow_pitch_joint, right_elbow_yaw_joint, right_wrist_pitch_joint, right_wrist_roll_joint,
+                left_hip_pitch_joint, left_hip_roll_joint, left_hip_yaw_joint, left_knee_pitch_joint,
+                left_ankle_pitch_joint, left_ankle_roll_joint,
+                right_hip_pitch_joint, right_hip_roll_joint, right_hip_yaw_joint, right_knee_pitch_joint,
+                right_ankle_pitch_joint, right_ankle_roll_joint]
+    # Waist is deliberately omitted: pd_zero + pd_stand controls these 3 joints.
+    publish_joint_list: [left_shoulder_pitch_joint, left_shoulder_roll_joint, left_shoulder_yaw_joint,
+                         left_elbow_pitch_joint, left_elbow_yaw_joint, left_wrist_pitch_joint, left_wrist_roll_joint,
+                         right_shoulder_pitch_joint, right_shoulder_roll_joint, right_shoulder_yaw_joint,
+                         right_elbow_pitch_joint, right_elbow_yaw_joint, right_wrist_pitch_joint, right_wrist_roll_joint,
+                         left_hip_pitch_joint, left_hip_roll_joint, left_hip_yaw_joint, left_knee_pitch_joint,
+                         left_ankle_pitch_joint, left_ankle_roll_joint,
+                         right_hip_pitch_joint, right_hip_roll_joint, right_hip_yaw_joint, right_knee_pitch_joint,
+                         right_ankle_pitch_joint, right_ankle_roll_joint]
+    # Match unitree_rl_mjlab X1_HOME and the ONNX action order.
+    init_state: [0.0, 0.0, 0.0,
+                 0.2, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
+                 0.2, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
+                 -0.15, 0.0, 0.0, 0.3, -0.15, 0.0,
+                 -0.15, 0.0, 0.0, 0.3, -0.15, 0.0]
+    stiffness:  [100.0, 100.0, 100.0,
+                 80.0, 80.0, 60.0, 80.0, 60.0, 30.0, 30.0,
+                 80.0, 80.0, 60.0, 80.0, 60.0, 30.0, 30.0,
+                 30.0, 40.0, 35.0, 100.0, 35.0, 35.0,
+                 30.0, 40.0, 35.0, 100.0, 35.0, 35.0]
+    damping:    [5.0, 5.0, 5.0,
+                 4.0, 4.0, 3.0, 4.0, 3.0, 2.0, 2.0,
+                 4.0, 4.0, 3.0, 4.0, 3.0, 2.0, 2.0,
+                 3.0, 3.0, 4.0, 10.0, 0.5, 0.5,
+                 3.0, 3.0, 4.0, 10.0, 0.5, 0.5]
+    walk_step_conf:
+      action_scale: 1.0
+      # Per-joint scales from unitree_rl_mjlab X1_ACTION_SCALE.
+      action_scales: [0.20, 0.20, 0.20,
+                      0.25, 0.25, 0.25, 0.25, 0.25, 0.15, 0.15,
+                      0.25, 0.25, 0.25, 0.25, 0.25, 0.15, 0.15,
+                      0.25, 0.25, 0.25, 0.20, 0.20, 0.20,
+                      0.25, 0.25, 0.25, 0.20, 0.20, 0.20]
+      decimation: 1
+      cycle_time: 1.0
+      sw_mode: False
+      cmd_threshold: 0.05
+    obs_scales:
+      lin_vel: 1.
+      ang_vel: 1.
+      dof_pos: 1.
+      dof_vel: 1.
+      quat: 1.
+    motion_file: cfg/control_module/policy/Leo_v3.npz
+    onnx_conf:
+      policy_file: cfg/control_module/policy/x1_Leo.onnx
+      actions_size: 29
+      observations_size: 154
+      num_hist: 1
+      observations_clip: 100.
+      actions_clip: 100.
+    # Reference terms used by the unitree_rl_mjlab tracking actor.
+    # Replace these neutral references with the motion frame used for training
+    # when deploying a specific motion.
+    reference_joint_pos: [0.0, 0.0, 0.0,
+                          0.15, -0.1, 0.0, 0.3, 0.0, 0.0, 0.0,
+                          0.15, -0.1, 0.0, 0.3, 0.0, 0.0, 0.0,
+                          0.4, 0.05, -0.31, 0.49, -0.21, 0.0,
+                          -0.4, -0.05, 0.31, 0.49, -0.21, 0.0]
+    reference_joint_vel: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    reference_anchor_ori: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
     lpf_conf:
       wc: 100.
       ts: 0.001

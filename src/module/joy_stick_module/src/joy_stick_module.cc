@@ -103,49 +103,57 @@ void JoyStickModule::MainLoop() {
     JoyStruct joy_data;
     joy_->GetJoyData(joy_data);
 
-    for (auto float_pub : float_pubs_) {
-      bool ret = true;
-      for (auto button : float_pub.buttons) {
-        ret &= joy_data.buttons[button];
+    // A joystick may be absent at startup or disconnected at runtime. Treat
+    // unavailable buttons/axes as inactive instead of indexing empty vectors.
+    const auto button_pressed = [&joy_data](const std::vector<uint8_t>& buttons) {
+      for (const auto button : buttons) {
+        if (button >= joy_data.buttons.size() || joy_data.buttons[button] == 0) {
+          return false;
+        }
       }
+      return true;
+    };
+    const auto axis_value = [&joy_data](uint8_t axis) {
+      return axis < joy_data.axis.size() ? joy_data.axis[axis] : 0.0;
+    };
+
+    for (const auto& float_pub : float_pubs_) {
+      const bool ret = button_pressed(float_pub.buttons);
       if (ret) {
         aimrt::channel::Publish<std_msgs::msg::Float32>(float_pub.pub, button_msgs);
       }
     }
 
     for (auto twist_pub : twist_pubs_) {
-      bool ret = true;
-      for (auto button : twist_pub.buttons) {
-        ret &= joy_data.buttons[button];
-      }
+      const bool ret = button_pressed(twist_pub.buttons);
       if (ret && limiter_) {
         array_t target_pos;
-        target_pos.resize(joy_data.axis.size());
+        target_pos.resize(twist_pub.axis.size());
         int32_t idx = 0;
 
         if (twist_pub.axis.find("linear-x") != twist_pub.axis.end()) {
-          vel_msgs.linear.x = joy_data.axis[twist_pub.axis["linear-x"]];
-          target_pos[idx++] = joy_data.axis[twist_pub.axis["linear-x"]];
+          vel_msgs.linear.x = axis_value(twist_pub.axis.at("linear-x"));
+          target_pos[idx++] = vel_msgs.linear.x;
         }
         if (twist_pub.axis.find("linear-y") != twist_pub.axis.end()) {
-          vel_msgs.linear.y = joy_data.axis[twist_pub.axis["linear-y"]];
-          target_pos[idx++] = joy_data.axis[twist_pub.axis["linear-y"]];
+          vel_msgs.linear.y = axis_value(twist_pub.axis.at("linear-y"));
+          target_pos[idx++] = vel_msgs.linear.y;
         }
         if (twist_pub.axis.find("linear-z") != twist_pub.axis.end()) {
-          vel_msgs.linear.z = joy_data.axis[twist_pub.axis["linear-z"]];
-          target_pos[idx++] = joy_data.axis[twist_pub.axis["linear-z"]];
+          vel_msgs.linear.z = axis_value(twist_pub.axis.at("linear-z"));
+          target_pos[idx++] = vel_msgs.linear.z;
         }
         if (twist_pub.axis.find("angular-x") != twist_pub.axis.end()) {
-          vel_msgs.angular.x = joy_data.axis[twist_pub.axis["angular-x"]];
-          target_pos[idx++] = joy_data.axis[twist_pub.axis["angular-x"]];
+          vel_msgs.angular.x = axis_value(twist_pub.axis.at("angular-x"));
+          target_pos[idx++] = vel_msgs.angular.x;
         }
         if (twist_pub.axis.find("angular-y") != twist_pub.axis.end()) {
-          vel_msgs.angular.y = joy_data.axis[twist_pub.axis["angular-y"]];
-          target_pos[idx++] = joy_data.axis[twist_pub.axis["angular-y"]];
+          vel_msgs.angular.y = axis_value(twist_pub.axis.at("angular-y"));
+          target_pos[idx++] = vel_msgs.angular.y;
         }
         if (twist_pub.axis.find("angular-z") != twist_pub.axis.end()) {
-          vel_msgs.angular.z = joy_data.axis[twist_pub.axis["angular-z"]];
-          target_pos[idx++] = joy_data.axis[twist_pub.axis["angular-z"]];
+          vel_msgs.angular.z = axis_value(twist_pub.axis.at("angular-z"));
+          target_pos[idx++] = vel_msgs.angular.z;
         }
         aimrt::channel::Publish<geometry_msgs::msg::Twist>(twist_pub.pub, vel_msgs);
 
@@ -174,10 +182,7 @@ void JoyStickModule::MainLoop() {
     }
 
     for (auto srv_client : srv_clients_) {
-      bool ret = true;
-      for (auto button : srv_client.buttons) {
-        ret &= joy_data.buttons[button];
-      }
+      const bool ret = button_pressed(srv_client.buttons);
       if (ret) {
         std::string cmd = "ros2 service call /" + srv_client.service_name + " " +
                           srv_client.interface_type + " > /dev/null &";

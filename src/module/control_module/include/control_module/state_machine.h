@@ -34,9 +34,11 @@ class StateMachine {
       trigger_state_map_[iter->second["trigger_topic"].as<std::string>()].push_back(state);
     }
 
-    // 初始化状态，将 yaml 中第一个状态作为初始状态
-    current_state_name_ = node.begin()->first.as<std::string>();
-    controllers_ = trigger_state_map_[node.begin()->second["trigger_topic"].as<std::string>()][0].controllers_;
+    // 默认直接进入站立状态。idle 的关节刚度/阻尼为 0，作为初始状态
+    // 会让仿真机器人在用户来得及触发状态切换前倒地。
+    auto initial_state = node["stand"] ? node["stand"] : node.begin()->second;
+    current_state_name_ = node["stand"] ? "stand" : node.begin()->first.as<std::string>();
+    controllers_ = trigger_state_map_[initial_state["trigger_topic"].as<std::string>()][0].controllers_;
   }
 
   bool OnEvent(const std::string &trigger_topic) {
