@@ -38,7 +38,7 @@ bool ControlModule::Initialize(aimrt::CoreRef core) {
                 // printf("RestartController: %s\n", name.c_str());
                 controller_map_[name]->RestartController();
               }
-              AIMRT_INFO("Trigger event: [{}] -> {}", trigger_topic, now_state);
+              AIMRT_INFO("State transition: [{}] -> {}", trigger_topic, now_state);
             }
           });
         AIMRT_CHECK_ERROR_THROW(ret, "Subscribe failed.");
@@ -167,8 +167,10 @@ bool ControlModule::MainLoop() {
       std::this_thread::sleep_until(next_iteration_time);
 
       auto controller_names = state_machine_.GetCurrentControllerNames();
+      bool motion_finished = false;
       for (const auto& name : controller_names) {
         controller_map_[name]->Update();
+        motion_finished = motion_finished || controller_map_[name]->IsFinished();
         my_ros2_proto::msg::JointCommand tmp_cmd = controller_map_[name]->GetJointCmdData();
         // 将 tmp_cmd 中的数据复制到 cmd_msg 中
         for (size_t ii = 0; ii < tmp_cmd.name.size(); ii++) {
@@ -182,6 +184,12 @@ bool ControlModule::MainLoop() {
         }
       }
       aimrt::channel::Publish<my_ros2_proto::msg::JointCommand>(joint_cmd_pub_, cmd_msg);
+      if (motion_finished && state_machine_.ReturnToStandIf("rl_leo", true)) {
+        for (const auto& name : state_machine_.GetCurrentControllerNames()) {
+          controller_map_[name]->RestartController();
+        }
+        AIMRT_INFO("State transition: [leo_motion_finished] -> stand");
+      }
     }
     AIMRT_INFO("Exit MainLoop.");
   } catch (const std::exception& e) {

@@ -107,6 +107,13 @@ Joy::~Joy() {
   SDL_Quit();
 }
 
+void Joy::ClearButtons(const std::vector<uint8_t>& buttons) {
+  std::lock_guard<std::mutex> lk(joy_msg_mutex_);
+  for (const auto button : buttons) {
+    if (button < joy_msg_.buttons.size()) joy_msg_.buttons[button] = 0;
+  }
+}
+
 void Joy::GetJoyData(JoyStruct& joy_data) {
   // while (!is_update_.load()) {
   //   std::this_thread::sleep_for(1ms);

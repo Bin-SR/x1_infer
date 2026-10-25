@@ -43,6 +43,12 @@ class StateMachine {
 
   bool OnEvent(const std::string &trigger_topic) {
     for (const auto& to_trans_state : trigger_state_map_[trigger_topic]) {
+      // A held keyboard/joystick button is published repeatedly. Do not
+      // treat an event targeting the current state as a new transition;
+      // otherwise leo -> leo repeatedly restarts the one-shot motion.
+      if (to_trans_state.state_name_ == current_state_name_) {
+        return false;
+      }
       auto iter = std::find(to_trans_state.pre_states_.begin(), to_trans_state.pre_states_.end(), current_state_name_);
 
       if (iter != to_trans_state.pre_states_.end()) {
@@ -62,6 +68,21 @@ class StateMachine {
   std::vector<std::string> GetCurrentControllerNames() {
     std::shared_lock<std::shared_mutex> shared_lock(controllers_mutex_);
     return controllers_;
+  }
+
+  // Used by one-shot motion controllers: return to stand after the motion.
+  bool ReturnToStandIf(const std::string& controller_name, bool finished) {
+    if (!finished || current_state_name_ != "leo") return false;
+    const auto& states = trigger_state_map_["/stand_mode"];
+    for (const auto& state : states) {
+      if (state.state_name_ != "stand") continue;
+      if (std::find(state.pre_states_.begin(), state.pre_states_.end(), current_state_name_) == state.pre_states_.end()) continue;
+      std::unique_lock<std::shared_mutex> lock(controllers_mutex_);
+      current_state_name_ = "stand";
+      controllers_ = state.controllers_;
+      return true;
+    }
+    return false;
   }
 
  private:

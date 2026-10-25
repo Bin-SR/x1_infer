@@ -44,11 +44,11 @@ bool JoyStickModule::Initialize(aimrt::CoreRef core) {
           TwistPub publisher;
           publisher.topic_name = pub["topic_name"].as<std::string>();
           publisher.buttons = pub["buttons"].as<std::vector<uint8_t>>();
-          publisher.axis = pub["axis"].as<std::map<std::string, uint8_t>>();
+          publisher.axis = pub["axis"].as<std::map<std::stri ng, uint8_t>>();
           publisher.pub = core_.GetChannelHandle().GetPublisher(publisher.topic_name);
           aimrt::channel::RegisterPublishType<geometry_msgs::msg::Twist>(publisher.pub);
           if (pub["velocity_limit_lb"] && pub["velocity_limit_ub"]) {
-            publisher.pub_limiter = core_.GetChannelHandle().GetPublisher(publisher.topic_name + "_limiter");
+            publisher.pub_limiter = core_.GetChannelHandle().GetPublisher(publisher.topic_name + "_limiter");  // topic: /cmd_vel + _limiter
             aimrt::channel::RegisterPublishType<geometry_msgs::msg::Twist>(publisher.pub_limiter);
 
             auto lb = pub["velocity_limit_lb"].as<std::vector<double>>();
@@ -99,6 +99,10 @@ void JoyStickModule::MainLoop() {
   // std_srvs::srv::EmptySyncProxy rpc_proxy(core_.GetRpcHandle());
   std_msgs::msg::Float32 button_msgs;
   geometry_msgs::msg::Twist vel_msgs;
+  // Mode commands are edge-triggered. Joy::joy_msg_ intentionally keeps the
+  // selected button latched, but a latched mode must not be republished after
+  // a one-shot Leo motion returns to stand.
+  std::vector<bool> previous_float_active(float_pubs_.size(), false);
   while (run_flag_.load()) {
     JoyStruct joy_data;
     joy_->GetJoyData(joy_data);
@@ -117,10 +121,17 @@ void JoyStickModule::MainLoop() {
       return axis < joy_data.axis.size() ? joy_data.axis[axis] : 0.0;
     };
 
-    for (const auto& float_pub : float_pubs_) {
+    for (size_t i = 0; i < float_pubs_.size(); ++i) {
+      const auto& float_pub = float_pubs_[i];
       const bool ret = button_pressed(float_pub.buttons);
-      if (ret) {
+      if (ret && !previous_float_active[i]) {
         aimrt::channel::Publish<std_msgs::msg::Float32>(float_pub.pub, button_msgs);
+        // Mode commands are one-shot. Clear the latch immediately so a later
+        // press of the same key creates a fresh rising edge.
+        joy_->ClearButtons(float_pub.buttons);
+        previous_float_active[i] = false;
+      } else {
+        previous_float_active[i] = ret;
       }
     }
 

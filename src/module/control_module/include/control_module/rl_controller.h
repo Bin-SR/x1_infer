@@ -16,6 +16,7 @@ class RLController : public ControllerBase {
 
   void Init(const YAML::Node &cfg_node) override;
   void RestartController() override;
+  bool IsFinished() const override { return motion_finished_.load(); }
 
   void Update() override;
   my_ros2_proto::msg::JointCommand GetJointCmdData() override;
@@ -81,7 +82,17 @@ class RLController : public ControllerBase {
   std::vector<float> motion_anchor_quat_;
   int motion_frames_{0};
   double motion_fps_{0.0};
+  // Desired anchor orientation in the motion/world frame. The actor expects
+  // motion_anchor_ori_b, so it is converted to the current body frame when
+  // the observation is assembled.
+  quaternion_t motion_anchor_quat_current_;
+  bool has_motion_anchor_quat_{false};
+  double transition_time_s_{1.0};
+  int64_t transition_cycles_{1000};
+  vector_t transition_start_pos_;
+  bool in_transition_{false};
   std::atomic_bool use_motion_reference_{false};
+  std::atomic_bool motion_finished_{false};
 
   // compute in algorithm
   std::vector<float> actions_;

@@ -41,6 +41,8 @@ using namespace std::chrono;
 
 namespace xyber_x1_infer::joy_stick_module {
 
+// 定义了结构体
+// 成员变量axis是xy线速度与z角速度，buttons是按键
 struct JoyStruct {
   std::vector<double> axis;
   std::vector<int32_t> buttons;
@@ -57,6 +59,8 @@ class Joy {
   ~Joy();
 
   void GetJoyData(JoyStruct& joy_data);
+  // Clear latched mode buttons after publishing a one-shot mode pulse.
+  void ClearButtons(const std::vector<uint8_t>& buttons);
 
  private:
   void eventThread();

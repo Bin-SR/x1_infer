@@ -22,6 +22,7 @@ class ControllerBase {
 
   virtual void Init(const YAML::Node &cfg_node) = 0;
   virtual void RestartController() = 0;
+  virtual bool IsFinished() const { return false; }
   virtual void SetCmdData(const geometry_msgs::msg::Twist joy_data);
   virtual void SetImuData(const sensor_msgs::msg::Imu imu_data);
   virtual void SetJointStateData(const sensor_msgs::msg::JointState joint_state_data, const std::unordered_map<std::string, int> &joint_state_index_map_);

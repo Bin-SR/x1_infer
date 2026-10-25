@@ -3,6 +3,7 @@
 #include <iostream>
 #include <fstream>
 #include <cstring>
+#include <cmath>
 #include <minizip/unzip.h>
 
 namespace xyber_x1_infer::rl_control_module {
@@ -124,11 +125,55 @@ void RLController::Init(const YAML::Node& cfg_node) {
 void RLController::RestartController() {
   is_first_frame_ = true;
   loop_count_ = 0;
+  motion_finished_.store(false);
+  has_motion_anchor_quat_ = false;
+  in_transition_ = (onnx_conf_.actions_size == 29 && motion_frames_ > 0);
+  transition_cycles_ = static_cast<int64_t>(std::max(1.0, transition_time_s_ * 1000.0));
+  if (in_transition_) {
+    std::shared_lock<std::shared_mutex> lock(joint_state_mutex_);
+    transition_start_pos_.resize(29);
+    for (int i = 0; i < 29; ++i) transition_start_pos_(i) = joint_state_data_.position[i];
+  }
 }
 
 void RLController::Update() {
   UpdateStateEstimation();
   if (onnx_conf_.actions_size == 29 && use_motion_reference_) {
+    // First move from the currently held stand pose to motion frame 0 using
+    // position targets only. The actor was trained with the robot already at
+    // frame 0, so running it before this transition creates a large impulse.
+    if (in_transition_) {
+      if (loop_count_ == 0) {
+        for (int i = 0; i < 29; ++i) {
+          if (lpf_conf_.paralle_list.find(joint_names_[i]) == lpf_conf_.paralle_list.end()) {
+            low_pass_filters_[i].init(propri_.joint_pos[i]);
+          } else {
+            low_pass_filters_[i].init(0);
+          }
+        }
+      }
+      const double alpha = std::min(1.0, static_cast<double>(loop_count_) /
+          static_cast<double>(transition_cycles_));
+      for (int i = 0; i < 29; ++i) {
+        // Linear handover requested for Leo: at alpha=0 the measured stand
+        // pose has weight 100%; at alpha=1 motion frame 0 has weight 100%.
+        // The reference pose is absolute joint position, so interpolate in
+        // joint-position space before converting to the policy action space.
+        const double target = transition_start_pos_(i) * (1.0 - alpha) +
+            motion_joint_pos_[i] * alpha;
+        actions_[i] = static_cast<float>((target - joint_conf_.init_state(i)) /
+            std::max(1e-6, walk_step_conf_.action_scales.empty()
+                ? walk_step_conf_.action_scale : walk_step_conf_.action_scales[i]));
+      }
+      loop_count_++;
+      if (loop_count_ >= transition_cycles_) {
+        in_transition_ = false;
+        loop_count_ = 0;
+        last_actions_.setZero();
+        is_first_frame_ = true;
+      }
+      return;
+    }
     UpdateMotionReference();
   }
   // compute observation & actions
@@ -140,6 +185,9 @@ void RLController::Update() {
 }
 
 my_ros2_proto::msg::JointCommand RLController::GetJointCmdData() {
+  // During the Leo handover this controller publishes the interpolated
+  // position target. It is listed after pd_leo_hold, so its command wins for
+  // all 29 policy joints.
   my_ros2_proto::msg::JointCommand joint_cmd;
   joint_cmd.name = publish_joint_names_;
   joint_cmd.position.resize(publish_joint_names_.size());
@@ -245,7 +293,14 @@ void RLController::LoadMotionReference(const std::string& path) {
   motion_joint_pos_ = std::move(pos);
   motion_joint_vel_ = std::move(vel);
   motion_anchor_quat_ = std::move(quat);
-  motion_fps_ = 50.0;
+  auto fps_bytes = ReadNpyFromNpz(path, "fps.npy");
+  // Leo_v3.npz stores fps as little-endian float64, while pose arrays are
+  // float32. Decode it with the correct element width (otherwise an f8
+  // scalar is interpreted as two unrelated f4 values).
+  auto fps = NpyFloat32<double>(fps_bytes);
+  if (fps.size() != 1 || !(fps[0] > 0.0) || !std::isfinite(fps[0]))
+    throw std::runtime_error("Invalid fps array in " + path);
+  motion_fps_ = fps[0];
   use_motion_reference_.store(true);
   std::cout << "Loaded motion reference [" << path << "], frames="
             << motion_frames_ << ", fps=" << motion_fps_ << std::endl;
@@ -256,14 +311,28 @@ void RLController::UpdateMotionReference() {
   // ControlModule runs at 1000 Hz in the X1 configuration.
   const int frame = std::min(motion_frames_ - 1,
       static_cast<int>(loop_count_ * motion_fps_ / 1000.0));
+  // Do not switch on the first update of the final frame. This gives the
+  // controller one complete final-frame control interval and avoids a
+  // one-frame discontinuity when returning to stand.
+  if (loop_count_ >= static_cast<int64_t>(std::ceil(
+          (motion_frames_ - 1) * 1000.0 / motion_fps_)) + 1) {
+    motion_finished_.store(true);
+  }
   reference_joint_pos_.assign(motion_joint_pos_.begin() + frame * 29,
                               motion_joint_pos_.begin() + (frame + 1) * 29);
   reference_joint_vel_.assign(motion_joint_vel_.begin() + frame * 29,
                               motion_joint_vel_.begin() + (frame + 1) * 29);
   const float* q = motion_anchor_quat_.data() + (frame * 30) * 4;
   Eigen::Quaternionf quat(q[0], q[1], q[2], q[3]);
-  Eigen::Matrix3f r = quat.normalized().toRotationMatrix();
-  reference_anchor_ori_ = {r(0,0), r(0,1), r(1,0), r(1,1), r(2,0), r(2,1)};
+  if (!std::isfinite(quat.w()) || !std::isfinite(quat.x()) ||
+      !std::isfinite(quat.y()) || !std::isfinite(quat.z()) ||
+      quat.squaredNorm() < 1e-8F) {
+    throw std::runtime_error("Invalid anchor quaternion in motion reference");
+  }
+  motion_anchor_quat_current_ = quaternion_t(
+      static_cast<scalar_t>(quat.w()), static_cast<scalar_t>(quat.x()),
+      static_cast<scalar_t>(quat.y()), static_cast<scalar_t>(quat.z())).normalized();
+  has_motion_anchor_quat_ = true;
 }
 
 void RLController::LoadModel() {
@@ -339,9 +408,27 @@ void RLController::ComputeObservation() {
           propri_.joint_vel(i) * obs_scales_.dof_vel;
       propri_obs(2 * 29 + 6 + 3 + 2 * 29 + i) = last_actions_(i);
     }
-    for (int i = 0; i < 6; ++i) {
-      propri_obs(58 + i) = reference_anchor_ori_[i];
+    // motion_anchor_ori_b = R_body_world^T * R_motion_world, first two
+    // columns flattened row-major, exactly as mjlab's matrix_from_quat(...)
+    // [..., :2].reshape(...). Using the reference orientation directly here
+    // makes the policy see world-frame values and is a common fall-down cause.
+    quaternion_t current_anchor = quaternion_t::Identity();
+    {
+      std::shared_lock<std::shared_mutex> lock(imu_mutex_);
+      current_anchor.w() = imu_data_.orientation.w;
+      current_anchor.x() = imu_data_.orientation.x;
+      current_anchor.y() = imu_data_.orientation.y;
+      current_anchor.z() = imu_data_.orientation.z;
     }
+    quaternion_t relative = current_anchor.conjugate() *
+        (has_motion_anchor_quat_ ? motion_anchor_quat_current_ : quaternion_t::Identity());
+    matrix_t ori = relative.normalized().toRotationMatrix();
+    propri_obs(58) = ori(0, 0);
+    propri_obs(59) = ori(0, 1);
+    propri_obs(60) = ori(1, 0);
+    propri_obs(61) = ori(1, 1);
+    propri_obs(62) = ori(2, 0);
+    propri_obs(63) = ori(2, 1);
     for (int i = 0; i < 3; ++i) {
       propri_obs(64 + i) = propri_.base_ang_vel(i) * obs_scales_.ang_vel;
     }
@@ -378,11 +465,18 @@ void RLController::ComputeObservation() {
       }
     }
 
-    // Set last_actions_ to 0
-    for (int ii = 5 + onnx_conf_.actions_size * 2; ii < 5 + onnx_conf_.actions_size * 3; ++ii) {
-      propri_obs(ii, 0) = 0.0;
+    // The Leo tracking actor already has a complete 154-D observation and
+    // num_hist=1.  The old walking-policy offsets (5 + 2*actions) must not
+    // be used here: they overwrite the reference orientation, gyro, and
+    // current joint position fields.  last_actions_ is initialized to zero,
+    // so only the Leo action block needs no further special handling.
+    if (!(onnx_conf_.actions_size == 29 && onnx_conf_.observations_size == 154)) {
+      for (int ii = 5 + onnx_conf_.actions_size * 2;
+           ii < 5 + onnx_conf_.actions_size * 3; ++ii) {
+        propri_obs(ii, 0) = 0.0;
+      }
     }
-  
+
     for (int ii = 0; ii < onnx_conf_.num_hist; ++ii) {
       propri_history_buffer_.segment(ii * onnx_conf_.observations_size, onnx_conf_.observations_size) = propri_obs.cast<float>();
     }
