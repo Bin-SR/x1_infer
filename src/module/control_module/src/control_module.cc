@@ -89,8 +89,34 @@ bool ControlModule::Initialize(aimrt::CoreRef core) {
         });
 
       subs_.push_back(core_.GetChannelHandle().GetSubscriber(cfg_node["sub_imu_data_name"].as<std::string>()));
+      std::cout << "IMU received, "  << std::endl;
       ret &= aimrt::channel::Subscribe<sensor_msgs::msg::Imu>(subs_.back(), 
         [this](const std::shared_ptr<const sensor_msgs::msg::Imu>& msg) {
+          
+          static uint64_t imu_count = 0;
+          ++imu_count;
+
+          if (imu_count % 1000 == 0) {
+            // std::cout << "IMU received, " << imu_count << std::endl;
+            AIMRT_INFO(
+                "IMU received, count={}, "
+                "quat=[{}, {}, {}, {}], "
+                "gyro=[{}, {}, {}], "
+                "acc=[{}, {}, {}]",
+                imu_count,
+                msg->orientation.w,
+                msg->orientation.x,
+                msg->orientation.y,
+                msg->orientation.z,
+                msg->angular_velocity.x,
+                msg->angular_velocity.y,
+                msg->angular_velocity.z,
+                msg->linear_acceleration.x,
+                msg->linear_acceleration.y,
+                msg->linear_acceleration.z);
+          }
+
+
           auto controller_names = state_machine_.GetCurrentControllerNames();
           for (const auto& name : controller_names) {
             controller_map_[name]->SetImuData(*msg);

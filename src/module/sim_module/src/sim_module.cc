@@ -22,8 +22,8 @@ bool SimModule::Initialize(aimrt::CoreRef core) {
 
     joint_cmd_sub_ = core_.GetChannelHandle().GetSubscriber(cfg_node["sub_joint_cmd_topic"].as<std::string>());
     aimrt::channel::Subscribe<my_ros2_proto::msg::JointCommand>(joint_cmd_sub_, std::bind(&SimModule::CmdCallback, this, std::placeholders::_1));
-    imu_data_pub_ = core_.GetChannelHandle().GetPublisher(cfg_node["pub_imu_data_topic"].as<std::string>());
-    aimrt::channel::RegisterPublishType<sensor_msgs::msg::Imu>(imu_data_pub_);
+    //imu_data_pub_ = core_.GetChannelHandle().GetPublisher(cfg_node["pub_imu_data_topic"].as<std::string>());
+    //aimrt::channel::RegisterPublishType<sensor_msgs::msg::Imu>(imu_data_pub_);
     joint_state_pub_ =core_.GetChannelHandle().GetPublisher(cfg_node["pub_joint_state_topic"].as<std::string>());
     aimrt::channel::RegisterPublishType<sensor_msgs::msg::JointState>(joint_state_pub_);
 
@@ -114,7 +114,7 @@ void SimModule::CmdCallback(const std::shared_ptr<const my_ros2_proto::msg::Join
   mj_step(m_, d_);
   ReadSensorData(imu_data_msg, joint_states_msg);
 
-  aimrt::channel::Publish<sensor_msgs::msg::Imu>(imu_data_pub_, imu_data_msg);
+  //aimrt::channel::Publish<sensor_msgs::msg::Imu>(imu_data_pub_, imu_data_msg);
   aimrt::channel::Publish<sensor_msgs::msg::JointState>(joint_state_pub_, joint_states_msg);
 }
 

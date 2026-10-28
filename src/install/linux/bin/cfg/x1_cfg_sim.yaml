@@ -33,6 +33,8 @@ aimrt:
       - topic_name: "(.*)"
         enable_backends: [local, ros2]
     sub_topics_options: # 为 subscribe topic 选择后端
+      - topic_name: "/imu/data"
+        enable_backends: [local, ros2]
       - topic_name: "(.*)"
         enable_backends: [local]
   rpc: # rpc相关配置
