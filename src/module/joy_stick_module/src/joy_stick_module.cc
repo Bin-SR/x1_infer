@@ -44,7 +44,7 @@ bool JoyStickModule::Initialize(aimrt::CoreRef core) {
           TwistPub publisher;
           publisher.topic_name = pub["topic_name"].as<std::string>();
           publisher.buttons = pub["buttons"].as<std::vector<uint8_t>>();
-          publisher.axis = pub["axis"].as<std::map<std::stri ng, uint8_t>>();
+          publisher.axis = pub["axis"].as<std::map<std::string, uint8_t>>();
           publisher.pub = core_.GetChannelHandle().GetPublisher(publisher.topic_name);
           aimrt::channel::RegisterPublishType<geometry_msgs::msg::Twist>(publisher.pub);
           if (pub["velocity_limit_lb"] && pub["velocity_limit_ub"]) {
