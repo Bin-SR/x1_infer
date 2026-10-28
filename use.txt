@@ -14,3 +14,21 @@ cd x1_infer/build
 ./run_sim.sh
 
 
+问题：IMU和DCU的数据不通问题
+解决：跳过DCU,将IMU直接与MiniPC通信，通过IMU官方提供的ROS2的接口
+目前在sim2sim中可以实现imu与机器人的通信：
+    (1).在sim2sim中，sim_module发布/imu/data 和 /joint_states话题，control_module接收这两个话题
+    本次改动，禁止sim_module发布/imu/data话题，改由IMU官方提供的ROS2接口，
+    将原yesense_node.cpp中要发布的数据类型为sensor_msgs::msg::Imu的/imu_data_ros话题名改为/imu/data
+    即代替了原sim_module中imu publisher的作用
+    (2).此外，在x1_cfg.yaml中，默认sub订阅通道只有local, 需要增加一个ros2, 来订阅ros2发布的话题
+commit: pass dcu/sim_module, using ros2 interface to read real imu data directly
+
+关于编译：
+1.修改.cc文件之后，如何重新编译：
+cd ~/x1_infer
+cmake --build build   --config Release   --target install   --parallel $(nproc)
+
+2.何时使用./build.sh：
+修改CMakeLists.txt，新增源文件，修改消息类型等
+
